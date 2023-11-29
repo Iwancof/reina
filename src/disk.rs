@@ -3,7 +3,7 @@ use std::{
     os::unix::prelude::FileExt,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct PageId(pub u64);
 
 pub struct DiskManager {
