@@ -1,9 +1,13 @@
 use crate::disk::{DiskManager, PageId};
 
 use std::cell::{Cell, RefCell};
-use std::collections::{VecDeque, HashMap};
+use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
+
+use lru::LruCache;
+use thiserror::Error;
 
 pub type Page = Vec<u8>; // length is PAGE_SIZE
 
@@ -13,6 +17,7 @@ pub struct InnerBufferFrame {
     is_dirty: Cell<bool>,
 }
 
+#[derive(Clone)]
 pub struct BufferFrame {
     inner: Arc<InnerBufferFrame>,
 }
@@ -42,31 +47,99 @@ impl BufferFrame {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct FrameId(usize);
-
 trait PoolAlgorithm {
     type Hint;
+    type PushError;
 
-    fn request_with_hint(&mut self, hint: Self::Hint, page_id: PageId) -> &BufferFrame;
-    fn request(&mut self, page_id: PageId) -> &BufferFrame;
-    fn evict(&mut self) -> Option<FrameId>;
+    fn new(size_hint: Option<usize>) -> Self;
+    fn request_with_hint(&mut self, hint: Self::Hint, page_id: PageId) -> Option<BufferFrame>;
+    fn request(&mut self, page_id: PageId) -> Option<BufferFrame>;
+    fn push(
+        &mut self,
+        page_id: PageId,
+        frame: BufferFrame,
+    ) -> Result<(PageId, BufferFrame), Self::PushError>;
 }
 
-impl<T: PoolAlgorithm> Index<FrameId> for T {
-    type Output = BufferFrame;
+impl PoolAlgorithm for LruCache<PageId, BufferFrame> {
+    type Hint = ();
+    type PushError = ();
 
-    fn index(&self, id: FrameId) -> &Self::Output {
-        self.request(id)
+    fn new(size_hint: Option<usize>) -> Self {
+        if let Some(size) = size_hint {
+            if size == 0 {
+                panic!("size_hint must be greater than 0");
+            }
+            Self::new(NonZeroUsize::new(size).unwrap())
+        } else {
+            Self::unbounded()
+        }
+    }
+
+    fn request_with_hint(&mut self, _: Self::Hint, page_id: PageId) -> Option<BufferFrame> {
+        self.get(&page_id).cloned()
+    }
+
+    fn request(&mut self, page_id: PageId) -> Option<BufferFrame> {
+        self.get(&page_id).cloned()
+    }
+
+    fn push(&mut self, page_id: PageId, frame: BufferFrame) -> Result<(PageId, BufferFrame), ()> {
+        self.push(page_id, frame).map_err(|(_, _)| ())
     }
 }
 
-pub struct LRUPool {
-    frames: Vec<BufferFrame>,
-    free_list: VecDeque<FrameId>,
-    table: HashMap<PageId, FrameId>,
+pub struct BufferPoolManager<Alg: PoolAlgorithm> {
+    disk_manager: DiskManager,
+    pool: Alg,
 }
 
-pub struct BufferPoolManager {
-    disk_manager: DiskManager,
+#[derive(Error)]
+pub enum BufferPoolError<Alg: PoolAlgorithm> {
+    #[error("pool algorithm error: {0}")]
+    PoolAlgorithmError(Alg::PushError),
+    #[error("disk manager error: {0}")]
+    DiskManagerError(std::io::Error),
+}
+
+impl<Alg: PoolAlgorithm> BufferPoolManager<Alg> {
+    pub fn new(disk_manager: DiskManager, pool_size: usize) -> Self {
+        Self {
+            disk_manager,
+            pool: Alg::new(Some(pool_size)),
+        }
+    }
+
+    pub fn fetch_page(&mut self, page_id: PageId) -> Result<BufferFrame, BufferPoolError<Alg>> {
+        if let Some(frame) = self.pool.request(page_id) {
+            return Ok(frame.clone());
+        }
+
+        let page_data = vec![0; self.disk_manager.get_page_size() as usize];
+        self.disk_manager
+            .read_page(page_id, &mut page_data)
+            .map_err(BufferPoolError::DiskManagerError)?;
+
+        let frame = BufferFrame::new(page_id, page_data);
+        let (evicted_page_id, evicted_frame) = self
+            .pool
+            .push(page_id, frame.clone())
+            .map_err(BufferPoolError::PoolAlgorithmError)?;
+
+        if evicted_frame.inner.is_dirty.get() {
+            let page_data = evicted_frame.get_page_ref();
+            self.disk_manager
+                .write_page(evicted_page_id, &page_data)
+                .map_err(BufferPoolError::DiskManagerError)?;
+        }
+
+        // 困った
+        // ここで、つまみ出された BufferFrame を flush したいが、もし他のところに clone
+        // されていたやつがこの後に書き込むと、誰もその変更を回収できない。
+        // そもそも、オリジナルの実装では他の参照者がいないことを確かめて、その上でキャッシュから消していた。
+        // LruCache crate を使っている限り、そういうことはできない気がする。諦めて自分で
+        // 確認機能付き Lru を実装するしかないのか？
+
+        Ok(evicted_frame)
+    }
 }

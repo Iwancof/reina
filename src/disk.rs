@@ -3,8 +3,8 @@ use std::{
     os::unix::prelude::FileExt,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PageId(u64);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PageId(pub u64);
 
 pub struct DiskManager {
     page_size: u64,
@@ -12,7 +12,7 @@ pub struct DiskManager {
 }
 
 impl DiskManager {
-    pub fn from_file(file: File, page_size: u64) -> Self {
+    pub const fn from_file(file: File, page_size: u64) -> Self {
         Self {
             page_size,
             heap_file: file,
@@ -26,6 +26,10 @@ impl DiskManager {
             .open(path)?;
         Ok(Self::from_file(file, page_size))
     }
+    pub const fn get_page_size(&self) -> u64 {
+        self.page_size
+    }
+
     pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
         self.heap_file.read_at(buf, offset)
     }
